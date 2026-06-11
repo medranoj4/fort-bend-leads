@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Fort Bend County — Motivated Seller Leads</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg: #0f1117; --surface: #1a1d27; --border: #2a2d3a;
+    --accent: #4f8ef7; --green: #22c55e; --amber: #f59e0b;
+    --red: #ef4444; --text: #e2e8f0; --muted: #94a3b8; --radius: 8px;
+  }
+  body { font-family: system-ui, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; padding: 1.5rem; }
+  header { display: flex; flex-wrap: wrap; gap: 1rem; align-items: center; justify-content: space-between; margin-bottom: 1.5rem; }
+  h1 { font-size: 1.4rem; font-weight: 700; }
+  h1 span { color: var(--accent); }
+  .meta { font-size: .8rem; color: var(--muted); }
+  .stats { display: flex; gap: .75rem; flex-wrap: wrap; margin-bottom: 1.25rem; }
+  .stat-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: .75rem 1.25rem; flex: 1 1 140px; }
+  .stat-card .label { font-size: .7rem; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+  .stat-card .value { font-size: 1.6rem; font-weight: 700; margin-top: .1rem; }
+  .controls { display: flex; gap: .6rem; flex-wrap: wrap; margin-bottom: 1rem; align-items: center; }
+  .controls input, .controls select { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); color: var(--text); padding: .45rem .75rem; font-size: .85rem; outline: none; }
+  .controls input { flex: 1 1 200px; }
+  .btn { border: none; border-radius: var(--radius); padding: .45rem 1rem; font-size: .85rem; cursor: pointer; font-weight: 600; }
+  .btn-export { background: var(--green); color: #fff; }
+  .table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: var(--radius); }
+  table { width: 100%; border-collapse: collapse; font-size: .82rem; }
+  thead { background: var(--surface); }
+  th { padding: .65rem .75rem; text-align: left; font-weight: 600; color: var(--muted); font-size: .75rem; text-transform: uppercase; white-space: nowrap; cursor: pointer; }
+  tbody tr { border-top: 1px solid var(--border); }
+  tbody tr:hover { background: rgba(79,142,247,.06); }
+  td { padding: .6rem .75rem; vertical-align: top; }
+  .score-badge { display: inline-block; font-weight: 700; font-size: .78rem; padding: .2rem .5rem; border-radius: 999px; min-width: 36px; text-align: center; }
+  .score-high { background: rgba(34,197,94,.18); color: var(--green); }
+  .score-med  { background: rgba(245,158,11,.18); color: var(--amber); }
+  .score-low  { background: rgba(148,163,184,.12); color: var(--muted); }
+  .badge { display: inline-block; font-size: .68rem; padding: .12rem .45rem; border-radius: 999px; margin: .1rem .1rem 0 0; white-space: nowrap; }
+  .badge-lp   { background: rgba(239,68,68,.18); color: #f87171; }
+  .badge-fc   { background: rgba(249,115,22,.18); color: #fb923c; }
+  .badge-jud  { background: rgba(168,85,247,.18); color: #c084fc; }
+  .badge-ln   { background: rgba(234,179,8,.18); color: #fde047; }
+  .badge-pro  { background: rgba(99,102,241,.18); color: #a5b4fc; }
+  .badge-new  { background: rgba(34,197,94,.18); color: var(--green); }
+  .badge-corp { background: rgba(148,163,184,.12); color: var(--muted); }
+  .badge-other { background: rgba(79,142,247,.12); color: var(--accent); }
+  td a { color: var(--accent); text-decoration: none; }
+  .addr-line { color: var(--muted); font-size: .78rem; }
+  .empty { text-align: center; padding: 3rem; color: var(--muted); }
+  .pagination { display: flex; gap: .4rem; align-items: center; justify-content: flex-end; margin-top: .75rem; font-size: .82rem; color: var(--muted); }
+  .pagination button { background: var(--surface); border: 1px solid var(--border); border-radius: 4px; color: var(--text); padding: .3rem .65rem; cursor: pointer; font-size: .82rem; }
+  .pagination button:disabled { opacity: .4; }
+  .pagination button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Fort Bend County <span>Motivated Seller Leads</span></h1>
+    <p class="meta" id="meta-line">Loading...</p>
+  </div>
+  <button class="btn btn-export" onclick="exportCSV()">Download GHL CSV</button>
+</header>
+<div class="stats">
+  <div class="stat-card"><div class="label">Total Leads</div><div class="value" id="s-total">-</div></div>
+  <div class="stat-card"><div class="label">With Address</div><div class="value" id="s-addr">-</div></div>
+  <div class="stat-card"><div class="label">High Score (70+)</div><div class="value" id="s-high">-</div></div>
+  <div class="stat-card"><div class="label">Lis Pendens</div><div class="value" id="s-lp">-</div></div>
+  <div class="stat-card"><div class="label">Foreclosure</div><div class="value" id="s-fc">-</div></div>
+  <div class="stat-card"><div class="label">Judgments/Liens</div><div class="value" id="s-jl">-</div></div>
+</div>
+<div class="controls">
+  <input type="text" id="search-box" placeholder="Search owner, doc #, address..." oninput="applyFilters()" />
+  <select id="filter-cat" onchange="applyFilters()">
+    <option value="">All Types</option>
+    <option value="LP">Lis Pendens</option>
+    <option value="NOFC">Foreclosure</option>
+    <option value="TAXDEED">Tax Deed</option>
+    <option value="JUD">Judgment</option>
+    <option value="LN">Lien</option>
+    <option value="PRO">Probate</option>
+    <option value="NOC">Notice of Commencement</option>
+    <option value="RELLP">Release LP</option>
+  </select>
+  <select id="filter-score" onchange="applyFilters()">
+    <option value="">All Scores</option>
+    <option value="70">High (70+)</option>
+    <option value="50">Medium (50+)</option>
+  </select>
+  <select id="page-size" onchange="applyFilters()">
+    <option value="25">25 / page</option>
+    <option value="50">50 / page</option>
+    <option value="100">100 / page</option>
+  </select>
+</div>
+<div class="table-wrap">
+  <table>
+    <thead>
+      <tr>
+        <th onclick="sortBy('score')">Score</th>
+        <th onclick="sortBy('filed')">Filed</th>
+        <th onclick="sortBy('cat_label')">Type</th>
+        <th onclick="sortBy('doc_num')">Doc #</th>
+        <th onclick="sortBy('owner')">Owner</th>
+        <th>Property Address</th>
+        <th>Mailing Address</th>
+        <th onclick="sortBy('amount')">Amount</th>
+        <th>Flags</th>
+        <th>Link</th>
+      </tr>
+    </thead>
+    <tbody id="tbl-body"></tbody>
+  </table>
+  <div class="empty" id="empty-msg" style="display:none">No records match your filters.</div>
+</div>
+<div class="pagination" id="pagination"></div>
+<script>
+let ALL_RECORDS = [], FILTERED = [], SORT_KEY = "score", SORT_DIR = -1, CUR_PAGE = 1;
+
+async function loadData() {
+  try {
+    const r = await fetch("records.json?_=" + Date.now());
+    const d = await r.json();
+    ALL_RECORDS = d.records || [];
+    document.getElementById("meta-line").textContent =
+      "Fetched: " + (d.fetched_at || "-") + "  |  Range: " + (d.date_range?.start || "-") + " to " + (d.date_range?.end || "-");
+    document.getElementById("s-total").textContent = d.total || 0;
+    document.getElementById("s-addr").textContent  = d.with_address || 0;
+    document.getElementById("s-high").textContent  = ALL_RECORDS.filter(r => r.score >= 70).length;
+    document.getElementById("s-lp").textContent    = ALL_RECORDS.filter(r => r.cat === "LP").length;
+    document.getElementById("s-fc").textContent    = ALL_RECORDS.filter(r => r.cat === "NOFC").length;
+    document.getElementById("s-jl").textContent    = ALL_RECORDS.filter(r => ["JUD","LN"].includes(r.cat)).length;
+    applyFilters();
+  } catch(e) {
+    document.getElementById("meta-line").textContent = "Could not load records.json";
+  }
+}
+
+function applyFilters() {
+  const q = document.getElementById("search-box").value.toLowerCase();
+  const cat = document.getElementById("filter-cat").value;
+  const minS = parseInt(document.getElementById("filter-score").value || "0");
+  FILTERED = ALL_RECORDS.filter(r => {
+    if (cat && r.cat !== cat) return false;
+    if (r.score < minS) return false;
+    if (q && !JSON.stringify(r).toLowerCase().includes(q)) return false;
+    return true;
+  });
+  FILTERED.sort((a,b) => {
+    let av = a[SORT_KEY] ?? "", bv = b[SORT_KEY] ?? "";
+    if (typeof av === "number") return SORT_DIR * (av - bv);
+    return SORT_DIR * String(av).localeCompare(String(bv));
+  });
+  CUR_PAGE = 1;
+  render();
+}
+
+function sortBy(key) {
+  SORT_DIR = SORT_KEY === key ? SORT_DIR * -1 : -1;
+  SORT_KEY = key;
+  render();
+}
+
+const CAT_BADGE = { LP:"badge-lp", NOFC:"badge-fc", TAXDEED:"badge-fc", JUD:"badge-jud", LN:"badge-ln", PRO:"badge-pro", NOC:"badge-other", RELLP:"badge-other" };
+
+function flagBadge(f) {
+  const cls = f.includes("pendens") ? "badge-lp" : f.includes("foreclosure") ? "badge-fc" : f.includes("Judgment") ? "badge-jud" : f.includes("lien") ? "badge-ln" : f.includes("Probate") ? "badge-pro" : f.includes("New") ? "badge-new" : f.includes("LLC") ? "badge-corp" : "badge-other";
+  return '<span class="badge ' + cls + '">' + f + '</span>';
+}
+
+function scoreBadge(s) {
+  const cls = s >= 70 ? "score-high" : s >= 50 ? "score-med" : "score-low";
+  return '<span class="score-badge ' + cls + '">' + s + '</span>';
+}
+
+function fmt(addr, city, state, zip) {
+  const l1 = addr || "";
+  const l2 = [city,state].filter(Boolean).join(", ") + (zip ? " " + zip : "");
+  if (!l1 && !l2.trim()) return '<span class="addr-line">-</span>';
+  return (l1 ? l1 + "<br>" : "") + '<span class="addr-line">' + l2 + '</span>';
+}
+
+function render() {
+  const size = parseInt(document.getElementById("page-size").value);
+  const pages = Math.max(1, Math.ceil(FILTERED.length / size));
+  CUR_PAGE = Math.min(CUR_PAGE, pages);
+  const slice = FILTERED.slice((CUR_PAGE-1)*size, CUR_PAGE*size);
+  const tbody = document.getElementById("tbl-body");
+  const empty = document.getElementById("empty-msg");
+  if (!slice.length) { tbody.innerHTML = ""; empty.style.display = "block"; }
+  else {
+    empty.style.display = "none";
+    tbody.innerHTML = slice.map(r => `<tr>
+      <td>${scoreBadge(r.score)}</td>
+      <td style="white-space:nowrap">${r.filed||"-"}</td>
+      <td><span class="badge ${CAT_BADGE[r.cat]||'badge-other'}">${r.cat_label||r.cat}</span></td>
+      <td style="font-family:monospace;font-size:.75rem">${r.doc_num||"-"}</td>
+      <td><div style="font-weight:600">${r.owner||"-"}</div>${r.grantee?'<div class="addr-line">to: '+r.grantee+'</div>':''}</td>
+      <td>${fmt(r.prop_address,r.prop_city,r.prop_state,r.prop_zip)}</td>
+      <td>${fmt(r.mail_address,r.mail_city,r.mail_state,r.mail_zip)}</td>
+      <td style="white-space:nowrap">${r.amount ? "$"+Number(r.amount).toLocaleString() : "-"}</td>
+      <td style="max-width:200px">${(r.flags||[]).map(flagBadge).join("")}</td>
+      <td><a href="${r.clerk_url||'#'}" target="_blank">View</a></td>
+    </tr>`).join("");
+  }
+  const pg = document.getElementById("pagination");
+  if (pages <= 1) { pg.innerHTML = ""; return; }
+  let html = '<span>' + ((CUR_PAGE-1)*size+1) + '-' + Math.min(CUR_PAGE*size,FILTERED.length) + ' of ' + FILTERED.length + '</span>';
+  html += '<button onclick="goPage(' + (CUR_PAGE-1) + ')"' + (CUR_PAGE===1?' disabled':'') + '>Prev</button>';
+  for (let i=1;i<=pages;i++) html += '<button class="'+(i===CUR_PAGE?'active':'')+'" onclick="goPage('+i+')">'+i+'</button>';
+  html += '<button onclick="goPage(' + (CUR_PAGE+1) + ')"' + (CUR_PAGE===pages?' disabled':'') + '>Next</button>';
+  pg.innerHTML = html;
+}
+
+function goPage(p) { CUR_PAGE = p; render(); }
+
+function exportCSV() {
+  const cols = ["First Name","Last Name","Mailing Address","Mailing City","Mailing State","Mailing Zip","Property Address","Property City","Property State","Property Zip","Lead Type","Document Type","Date Filed","Document Number","Amount/Debt Owed","Seller Score","Motivated Seller Flags","Source","Public Records URL"];
+  function esc(v) { const s = String(v??''); return (s.includes(',')||s.includes('"')) ? '"'+s.replace(/"/g,'""')+'"' : s; }
+  function splitName(n) { n=(n||'').trim(); if(!n) return ['','']; if(n.includes(',')) { const p=n.split(',',2); return [p[1].trim().split(' ')[0],p[0].trim()]; } const t=n.split(' '); return t.length===1?['',t[0]]:[t[0],t.slice(1).join(' ')]; }
+  const rows = FILTERED.map(r => { const [fn,ln]=splitName(r.owner); return [fn,ln,r.mail_address,r.mail_city,r.mail_state||'TX',r.mail_zip,r.prop_address,r.prop_city,r.prop_state||'TX',r.prop_zip,r.cat_label,r.doc_type,r.filed,r.doc_num,r.amount||'',r.score,(r.flags||[]).join(' | '),'Fort Bend County Clerk',r.clerk_url].map(esc).join(','); });
+  const csv = [cols.join(','),...rows].join('\n');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([csv],{type:'text/csv'}));
+  a.download = 'fb_leads_' + new Date().toISOString().slice(0,10) + '.csv';
+  a.click();
+}
+
+loadData();
+</script>
+</body>
+</html>

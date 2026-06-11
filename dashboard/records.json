@@ -1,7 +1,10 @@
 {
-  "fetched_at": null,
+  "fetched_at": "2026-06-11T16:42:08.448816Z",
   "source": "Fort Bend County Clerk + FBCAD",
-  "date_range": {"start": null, "end": null},
+  "date_range": {
+    "start": "2026-06-04",
+    "end": "2026-06-11"
+  },
   "total": 0,
   "with_address": 0,
   "records": []

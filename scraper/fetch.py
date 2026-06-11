@@ -1,7 +1,6 @@
 """
 Fort Bend County, TX — Motivated Seller Lead Scraper
 Clerk: ccweb.co.fort-bend.tx.us/RealEstate/SearchEntry.aspx
-Parcel: FBCAD OwnerExport.txt + PropertyExport.txt
 """
 from __future__ import annotations
 import asyncio, csv, io, json, logging, os, re, time, zipfile
@@ -30,6 +29,7 @@ HEADLESS      = os.getenv("HEADLESS", "true").lower() != "false"
 
 CLERK_BASE   = "http://ccweb.co.fort-bend.tx.us"
 CLERK_SEARCH = "http://ccweb.co.fort-bend.tx.us/RealEstate/SearchEntry.aspx"
+CLERK_RESULTS= "http://ccweb.co.fort-bend.tx.us/RealEstate/SearchResults.aspx"
 FBCAD_URL    = "https://www.fbcad.org/data-files/"
 
 DOC_TYPE_MAP = {
@@ -127,8 +127,7 @@ class ParcelLookup:
                            and n.lower().endswith((".txt",".csv"))]
             prop_files  = [n for n in names if "property" in n.lower()
                            and n.lower().endswith((".txt",".csv"))]
-            if not owner_files:
-                return 0
+            if not owner_files: return 0
 
             addr_map: dict[str,dict] = {}
             if prop_files:
@@ -221,55 +220,52 @@ async def scrape_clerk(start_date: str, end_date: str) -> list[dict]:
         )
         page = await ctx.new_page()
 
-        # Load the real search page
         log.info("Loading clerk search page ...")
         try:
             resp = await page.goto(CLERK_SEARCH,
                                    wait_until="domcontentloaded", timeout=30000)
-            log.info("Search page status: %d | title: %s",
-                     resp.status if resp else 0, await page.title())
+            log.info("Search page: %d | %s", resp.status if resp else 0, await page.title())
         except Exception as e:
             log.warning("Could not load search page: %s", e)
             await browser.close(); return []
 
         await asyncio.sleep(2)
 
-        # Dump page structure once so we understand the form
+        # Get the hidden ASP.NET fields we need for POST requests
         content = await page.content()
         soup    = BeautifulSoup(content, "lxml")
-        log.info("Page URL after load: %s", page.url)
+        vs   = soup.find("input", {"name":"__VIEWSTATE"})
+        evv  = soup.find("input", {"name":"__EVENTVALIDATION"})
+        vsg  = soup.find("input", {"name":"__VIEWSTATEGENERATOR"})
 
-        # Log all inputs and selects
-        all_inputs = soup.find_all(["input","select","textarea"])
-        log.info("Form fields found: %d", len(all_inputs))
-        for el in all_inputs[:20]:
-            log.info("  field: tag=%s name=%s id=%s type=%s value=%s",
-                     el.name, el.get("name",""), el.get("id",""),
-                     el.get("type",""), el.get("value","")[:50] if el.get("value") else "")
-
-        # Log select options (doc type dropdown)
+        # Find the instrument type dropdown — it's for date range search by doc type
+        # The real doc type field on this form is likely "ddlDocType" or similar
+        # Log ALL select fields and their options
         for sel in soup.find_all("select"):
-            opts = [(o.get("value",""), o.get_text(strip=True)[:30])
+            opts = [(o.get("value",""), o.get_text(strip=True)[:20])
                     for o in sel.find_all("option")]
-            log.info("  select name=%s id=%s options=%s",
-                     sel.get("name",""), sel.get("id",""), opts[:10])
+            log.info("SELECT: name=%s id=%s opts=%s",
+                     sel.get("name","?"), sel.get("id","?"), opts[:15])
+
+        # Find the instrument date range fields
+        for inp in soup.find_all("input", {"type":"text"}):
+            log.info("INPUT text: name=%s id=%s", inp.get("name","?"), inp.get("id","?"))
 
         for doc_code in TARGET_CODES:
             log.info("Searching: %s", doc_code)
             rows = []
             for attempt in range(RETRY_ATTEMPTS):
                 try:
-                    rows = await _aspx_search(page, doc_code, start_date, end_date, soup)
+                    rows = await _search_by_instrument_date(
+                        page, doc_code, start_date, end_date)
                     break
                 except Exception as e:
                     log.warning("  attempt %d: %s", attempt+1, e)
                     await asyncio.sleep(RETRY_DELAY*(attempt+1))
-                    # Reload search page between retries
                     try:
-                        await page.goto(CLERK_SEARCH, wait_until="domcontentloaded", timeout=20000)
+                        await page.goto(CLERK_SEARCH,
+                                        wait_until="domcontentloaded", timeout=20000)
                         await asyncio.sleep(1)
-                        content = await page.content()
-                        soup = BeautifulSoup(content,"lxml")
                     except: pass
             records.extend(rows)
 
@@ -278,122 +274,182 @@ async def scrape_clerk(start_date: str, end_date: str) -> list[dict]:
     return records
 
 
-async def _aspx_search(page: Page, doc_code: str,
-                        start: str, end: str, soup: BeautifulSoup) -> list[dict]:
+async def _search_by_instrument_date(page: Page, doc_code: str,
+                                      start: str, end: str) -> list[dict]:
+    """
+    The Fort Bend clerk search works like this:
+    - SearchEntry.aspx has a form with instrument type + date range
+    - We select the doc type from the dropdown, set dates, click Search
+    - Results appear at SearchResults.aspx in a specific table
+    - The results table has columns: Inst #, Book, Page, Filed, Doc Type,
+      Grantor, Grantee, Legal, Consideration
+    """
     results = []
 
-    # Find the doc type select element
-    doc_select = None
+    # Make sure we're on the search page
+    if "SearchEntry" not in page.url and "SearchResult" not in page.url:
+        await page.goto(CLERK_SEARCH, wait_until="domcontentloaded", timeout=20000)
+        await asyncio.sleep(1)
+
+    content = await page.content()
+    soup = BeautifulSoup(content, "lxml")
+
+    # Find the document type select — look for one with instrument/doc type options
+    doc_type_select_id = None
     for sel in soup.find_all("select"):
-        opts = [o.get("value","") for o in sel.find_all("option")]
-        # If options look like doc type codes or the field name suggests it
-        name = sel.get("name","").lower() + sel.get("id","").lower()
-        if any(x in name for x in ("doc","type","instrument","record")):
-            doc_select = sel.get("name") or sel.get("id")
+        opts_vals = [o.get("value","").strip() for o in sel.find_all("option")]
+        # The doc type dropdown will have values like "LP", "DEED", "MTG" etc
+        # or it might have descriptions
+        sel_id = sel.get("id","") or sel.get("name","")
+        if any(v in TARGET_CODES for v in opts_vals):
+            doc_type_select_id = sel_id
+            log.info("Found doc type select: %s with options %s", sel_id, opts_vals[:10])
             break
-        # Or if options contain our doc codes
-        if any(o.upper() in TARGET_CODES for o in opts):
-            doc_select = sel.get("name") or sel.get("id")
+        # Also check if it's the instrument type field by name
+        if any(x in sel_id.lower() for x in ("doctype","doc_type","instrtype",
+                                               "instrument","rectype","recordtype")):
+            doc_type_select_id = sel_id
+            log.info("Found doc type select by name: %s", sel_id)
             break
 
     # Find date fields
-    start_field = None
-    end_field   = None
-    for inp in soup.find_all("input"):
-        name = (inp.get("name","") + inp.get("id","")).lower()
-        if any(x in name for x in ("start","begin","from","date1","filed")):
-            start_field = inp.get("name") or inp.get("id")
-        elif any(x in name for x in ("end","to","thru","date2","filed")):
-            end_field = inp.get("name") or inp.get("id")
+    start_id = end_id = None
+    for inp in soup.find_all("input", {"type":"text"}):
+        iid = inp.get("id","") or inp.get("name","")
+        iid_low = iid.lower()
+        if any(x in iid_low for x in ("datefrom","datebegin","startdate",
+                                        "begindate","date1","fromdate","filed")):
+            start_id = iid
+        elif any(x in iid_low for x in ("dateto","dateend","enddate",
+                                          "thrudate","date2","todate")):
+            end_id = iid
 
-    log.info("  %s: doc_select=%s start=%s end=%s",
-             doc_code, doc_select, start_field, end_field)
+    log.info("  %s: doctype_sel=%s start=%s end=%s",
+             doc_code, doc_type_select_id, start_id, end_id)
 
-    # Try to fill and submit the form
-    if doc_select:
+    # Fill the form
+    filled = False
+    if doc_type_select_id:
         try:
-            await page.select_option(f"[name='{doc_select}'],[id='{doc_select}']", doc_code)
-        except Exception as e:
-            log.warning("  Could not select doc type: %s", e)
+            await page.select_option(
+                f"#{doc_type_select_id}, [name='{doc_type_select_id}']",
+                value=doc_code, timeout=5000)
+            filled = True
+        except:
+            # Try by label text
+            try:
+                await page.select_option(
+                    f"#{doc_type_select_id}, [name='{doc_type_select_id}']",
+                    label=doc_code, timeout=3000)
+                filled = True
+            except: pass
 
-    if start_field:
+    if start_id:
         try:
-            await page.fill(f"[name='{start_field}'],[id='{start_field}']", start)
-        except Exception as e:
-            log.warning("  Could not fill start date: %s", e)
+            await page.fill(f"#{start_id}, [name='{start_id}']", start)
+        except: pass
 
-    if end_field:
+    if end_id:
         try:
-            await page.fill(f"[name='{end_field}'],[id='{end_field}']", end)
-        except Exception as e:
-            log.warning("  Could not fill end date: %s", e)
+            await page.fill(f"#{end_id}, [name='{end_id}']", end)
+        except: pass
 
-    # Submit — try button click first, then Enter
-    submitted = False
-    for btn_sel in ["input[type='submit']","button[type='submit']",
-                    "input[value*='Search']","button:has-text('Search')",
-                    "#btnSearch","[id*='Search'][type='button']"]:
+    # Click Search button
+    search_clicked = False
+    for btn_sel in [
+        "#cphNoMargin_SearchButtons1_btnSearch",
+        "input[value='Search']",
+        "input[id*='btnSearch']",
+        "button:has-text('Search')",
+        "input[type='submit']:not([value*='Clear'])",
+    ]:
         try:
             btn = await page.query_selector(btn_sel)
             if btn:
                 await btn.click()
-                submitted = True
+                search_clicked = True
+                log.info("  Clicked search button: %s", btn_sel)
                 break
         except: pass
 
-    if not submitted:
-        # Try pressing Enter on the last date field
-        try:
-            await page.keyboard.press("Enter")
-            submitted = True
-        except: pass
+    if not search_clicked:
+        log.warning("  Could not click search button for %s", doc_code)
 
-    if submitted:
-        await asyncio.sleep(2)
-        try:
-            await page.wait_for_load_state("networkidle", timeout=15000)
-        except: pass
+    await asyncio.sleep(2)
+    try:
+        await page.wait_for_load_state("networkidle", timeout=10000)
+    except: pass
 
+    # Parse SearchResults.aspx
     content = await page.content()
     soup2   = BeautifulSoup(content, "lxml")
 
-    # Log what we got back (for LP only to keep logs clean)
-    if doc_code == "LP":
-        log.info("  LP result page title: %s | url: %s",
-                 await page.title(), page.url)
-        tbls = soup2.find_all("table")
-        log.info("  Tables: %d", len(tbls))
-        for t in tbls[:3]:
-            rows = t.find_all("tr")
-            if rows:
-                hdrs = [th.get_text(strip=True)[:25] for th in rows[0].find_all(["th","td"])]
-                log.info("  Table hdrs: %s | rows: %d", hdrs, len(rows))
+    log.info("  Result URL: %s", page.url)
 
-    # Parse result tables
-    for tbl in soup2.find_all("table"):
+    # The results table on Fort Bend's portal has specific structure
+    # Find ALL tables and log their structure
+    tbls = soup2.find_all("table")
+    log.info("  Tables on results page: %d", len(tbls))
+
+    for ti, tbl in enumerate(tbls):
         rows = tbl.find_all("tr")
         if len(rows) < 2: continue
-        hdrs = [th.get_text(strip=True).lower() for th in rows[0].find_all(["th","td"])]
-        if not any(h in " ".join(hdrs)
-                   for h in ["grantor","grantee","document","instrument",
-                              "filed","recorded","name","date","number"]):
+        # Get all text from first row
+        first_row_text = " ".join(td.get_text(strip=True) for td in rows[0].find_all(["th","td"]))
+        if doc_code == "LP":
+            log.info("  Table %d: first_row=%s | total_rows=%d",
+                     ti, first_row_text[:80], len(rows))
+
+        # Skip obvious navigation/header tables
+        skip_keywords = ["login","basket","menu","navigation","header","footer",
+                          "copyright","search ins","criteria","sort by","get a free"]
+        if any(kw in first_row_text.lower() for kw in skip_keywords):
             continue
+
+        # The real results table will have columns like:
+        # Inst #, Filed Date, Doc Type, Grantor, Grantee, Book, Page, Consideration
+        hdrs = [th.get_text(strip=True).lower()
+                for th in rows[0].find_all(["th","td"])]
+
+        # Must have at least grantor or instrument # to be a real results table
+        hdr_str = " ".join(hdrs)
+        is_results = any(x in hdr_str for x in
+                         ["inst", "grantor", "grantee", "filed", "instrument",
+                          "book", "consideration", "doc type"])
+        if not is_results:
+            continue
+
+        log.info("  Parsing table %d: hdrs=%s rows=%d", ti, hdrs[:8], len(rows))
+
         for tr in rows[1:]:
             cells = tr.find_all("td")
-            if not cells: continue
+            if len(cells) < 3: continue
+
+            # Skip rows that are clearly UI noise
+            row_text = " ".join(c.get_text(strip=True) for c in cells)
+            if any(x in row_text.lower() for x in
+                   ["get a free copy", "sort by", "results list",
+                    "new search", "refine search", "0records"]):
+                continue
+
             raw = {}
-            for i,cell in enumerate(cells):
-                k = hdrs[i] if i<len(hdrs) else f"c{i}"
+            for i, cell in enumerate(cells):
+                k = hdrs[i] if i < len(hdrs) else f"c{i}"
                 raw[k] = cell.get_text(strip=True)
-                a = cell.find("a",href=True)
-                if a: raw[k+"_href"] = a["href"]
+                a = cell.find("a", href=True)
+                if a:
+                    href = a["href"]
+                    if not href.startswith("http"):
+                        href = CLERK_BASE + "/" + href.lstrip("/")
+                    raw[k+"_href"] = href
             raw["_code"] = doc_code
             rec = _make_record(raw)
-            if rec: results.append(rec)
+            if rec and rec.get("doc_num","N/A") != "N/A" and rec.get("doc_num",""):
+                results.append(rec)
 
-    # Go back to search page for next query
+    # Navigate back to search for next query
     try:
-        await page.goto(CLERK_SEARCH, wait_until="domcontentloaded", timeout=20000)
+        await page.goto(CLERK_SEARCH, wait_until="domcontentloaded", timeout=15000)
         await asyncio.sleep(1)
     except: pass
 
@@ -408,32 +464,49 @@ def _make_record(raw):
         def g(*ks):
             for k in ks:
                 for ak in raw:
-                    if k in ak.lower() and not ak.endswith("_href"):
+                    if k.lower() in ak.lower() and not ak.endswith("_href"):
                         v=raw[ak]
-                        if v: return v
+                        if v and len(str(v)) < 200: return str(v)
             return ""
         def gh(*ks):
             for k in ks:
                 for ak in raw:
-                    if k in ak.lower() and ak.endswith("_href"):
+                    if k.lower() in ak.lower() and ak.endswith("_href"):
                         return raw[ak]
             return ""
-        doc_num = g("instrument","doc #","docnum","number")
-        filed   = g("filed","recorded","date")
-        grantor = g("grantor","owner","from","name")
-        grantee = g("grantee","to","buyer","lender")
-        legal   = g("legal","description")
-        amount  = g("amount","consideration","debt")
-        link    = gh("instrument","doc","view") or g("url","link")
+
+        # Map known Fort Bend column names
+        doc_num = (g("inst #","inst#","instrument #","instrument#","inst num") or
+                   g("c0","number","doc #","docnum"))
+        filed   = g("filed","date filed","recorded","date")
+        grantor = g("grantor","name","owner","from","c4","c5")
+        grantee = g("grantee","to","buyer","c5","c6")
+        legal   = g("legal","description","c7","c8")
+        amount  = g("consideration","amount","value","c8","c9")
+        link    = gh("inst","doc","view","c0")
+
+        # Clean up doc_num — must look like an actual instrument number
+        # Fort Bend instrument numbers are typically numeric or alphanumeric
+        doc_num = doc_num.strip()
+        if not doc_num or len(doc_num) > 50:
+            return None
+        # Skip obvious junk
+        if any(x in doc_num.lower() for x in
+               ["criteria", "records found", "sort by", "get a free",
+                "results list", "new search", "click here"]):
+            return None
+
         fn = ""
         for fmt in ("%m/%d/%Y","%Y-%m-%d","%m-%d-%Y"):
             try: fn=datetime.strptime(filed[:10],fmt).strftime("%Y-%m-%d"); break
             except: pass
+
         if link and not link.startswith("http"):
             link = CLERK_BASE+"/"+link.lstrip("/")
         if not link:
-            link = CLERK_SEARCH
-        return {"doc_num":doc_num or "N/A","doc_type":code,"filed":fn,
+            link = CLERK_RESULTS
+
+        return {"doc_num":doc_num,"doc_type":code,"filed":fn,
                 "cat":cat,"cat_label":label,"owner":grantor.strip(),
                 "grantee":grantee.strip(),"amount":safe_float(amount),
                 "legal":legal.strip(),"clerk_url":link,

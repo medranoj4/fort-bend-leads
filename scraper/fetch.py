@@ -1,13 +1,20 @@
 """
 Fort Bend County, TX — Motivated Seller Lead Scraper
-Direct HTTP POST to ccweb.co.fort-bend.tx.us
+Uses Playwright to set Telerik RadDatePicker fields via JS,
+then submits the form and parses SearchResults.aspx
 """
 from __future__ import annotations
-import csv, io, json, logging, os, re, time, zipfile
+import asyncio, csv, io, json, logging, os, re, time, zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import requests
 from bs4 import BeautifulSoup
+
+try:
+    from playwright.async_api import async_playwright, Page
+    HAS_PLAYWRIGHT = True
+except ImportError:
+    HAS_PLAYWRIGHT = False
 
 try:
     from dbfread import DBF
@@ -19,28 +26,30 @@ BASE_DIR      = Path(__file__).resolve().parent.parent
 DASHBOARD_DIR = BASE_DIR / "dashboard"
 DATA_DIR      = BASE_DIR / "data"
 LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "7"))
+HEADLESS      = os.getenv("HEADLESS", "true").lower() != "false"
 
 CLERK_BASE   = "http://ccweb.co.fort-bend.tx.us"
 CLERK_SEARCH = "http://ccweb.co.fort-bend.tx.us/RealEstate/SearchEntry.aspx"
 FBCAD_URL    = "https://www.fbcad.org/data-files/"
 
+# Portal doc type checkbox values (confirmed from form inspection)
 DOC_TYPE_MAP = {
-    "LP":       ("LP",      "Lis Pendens",                  ["LISPEN"]),
-    "NOFC":     ("NOFC",    "Notice of Foreclosure",        ["NOTICE"]),
-    "TAXDEED":  ("TAXDEED", "Tax Deed",                     ["DEED","STLIEN"]),
-    "JUD":      ("JUD",     "Judgment",                     ["JUDGE"]),
-    "CCJ":      ("JUD",     "Certified Judgment",           ["JUDGE"]),
-    "DRJUD":    ("JUD",     "Domestic Relations Judgment",  ["JUDGE"]),
-    "LNCORPTX": ("LN",      "Corp Tax Lien",                ["FEDLIEN","LIEN"]),
-    "LNIRS":    ("LN",      "IRS Lien",                     ["FEDLIEN"]),
-    "LNFED":    ("LN",      "Federal Lien",                 ["FEDLIEN"]),
-    "LN":       ("LN",      "Lien",                         ["LIEN","STLIEN"]),
-    "LNMECH":   ("LN",      "Mechanic Lien",                ["LIEN"]),
-    "LNHOA":    ("LN",      "HOA Lien",                     ["LIEN"]),
-    "MEDLN":    ("LN",      "Medicaid Lien",                ["LIEN","FEDLIEN"]),
-    "PRO":      ("PRO",     "Probate Document",             ["HEIRSHIP","BANKRUPT"]),
-    "NOC":      ("NOC",     "Notice of Commencement",       ["NOTICE"]),
-    "RELLP":    ("RELLP",   "Release Lis Pendens",          ["RELEASE","LISPEN"]),
+    "LP":       ("LP",      "Lis Pendens",                 ["LISPEN"]),
+    "NOFC":     ("NOFC",    "Notice of Foreclosure",       ["NOTICE"]),
+    "TAXDEED":  ("TAXDEED", "Tax Deed",                    ["DEED"]),
+    "JUD":      ("JUD",     "Judgment",                    ["JUDGE"]),
+    "CCJ":      ("JUD",     "Certified Judgment",          ["JUDGE"]),
+    "DRJUD":    ("JUD",     "Domestic Relations Judgment", ["JUDGE"]),
+    "LNCORPTX": ("LN",      "Corp Tax Lien",               ["FEDLIEN"]),
+    "LNIRS":    ("LN",      "IRS Lien",                    ["FEDLIEN"]),
+    "LNFED":    ("LN",      "Federal Lien",                ["FEDLIEN"]),
+    "LN":       ("LN",      "Lien",                        ["LIEN"]),
+    "LNMECH":   ("LN",      "Mechanic Lien",               ["LIEN"]),
+    "LNHOA":    ("LN",      "HOA Lien",                    ["LIEN"]),
+    "MEDLN":    ("LN",      "Medicaid Lien",               ["LIEN"]),
+    "PRO":      ("PRO",     "Probate Document",            ["HEIRSHIP"]),
+    "NOC":      ("NOC",     "Notice of Commencement",      ["NOTICE"]),
+    "RELLP":    ("RELLP",   "Release Lis Pendens",         ["RELEASE"]),
 }
 TARGET_CODES   = list(DOC_TYPE_MAP.keys())
 RETRY_ATTEMPTS = 3
@@ -198,253 +207,266 @@ def compute_score(rec):
 
 # ── Clerk scraper ─────────────────────────────────────────────────────────────
 
-def _make_date_client_state(date_str: str) -> str:
+def _telerik_state(date_str: str) -> str:
+    """Build Telerik RadDatePicker clientState JSON."""
+    return json.dumps({
+        "enabled": True,
+        "emptyMessage": "",
+        "validationText": date_str,
+        "valueAsString": date_str,
+        "minDateStr": "1/1/1980 0:0:0",
+        "maxDateStr": "1/1/2099 0:0:0",
+        "lastSetTextBoxValue": date_str
+    }, separators=(',',':'))
+
+
+async def _set_date_via_js(page: Page, control_id: str, date_str: str):
     """
-    Build the Telerik RadDatePicker clientState JSON string.
-    Format: {"minDate":"1/1/1980","maxDate":"1/1/2099","selectedDate":"MM/DD/YYYY","focused":true}
+    Set a Telerik RadDatePicker value using JavaScript.
+    control_id is the client-side ID like 'cphNoMargin_f_ddcDateFiledFrom'
     """
-    return (f'{{"minDate":"1/1/1980","maxDate":"1/1/2099",'
-            f'"selectedDate":"{date_str}","focused":false}}')
+    state = _telerik_state(date_str)
+    js = f"""
+    (function() {{
+        // Set the visible text input
+        var inp = document.getElementById('{control_id}_dateInput');
+        if (inp) {{ inp.value = '{date_str}'; }}
+
+        // Set the hidden clientState field
+        var cs = document.getElementById('{control_id}_dateInput_ClientState');
+        if (cs) {{ cs.value = {json.dumps(state)}; }}
+
+        var cs2 = document.getElementById('{control_id}_ClientState');
+        if (cs2) {{ cs2.value = {json.dumps(state)}; }}
+
+        // Also try the Telerik JS API if available
+        if (window.$find) {{
+            var picker = $find('{control_id}');
+            if (picker) {{
+                var d = new Date('{date_str}');
+                picker.set_selectedDate(d);
+            }}
+        }}
+        return true;
+    }})();
+    """
+    try:
+        await page.evaluate(js)
+        log.debug("Set date %s on %s via JS", date_str, control_id)
+    except Exception as e:
+        log.debug("JS date set failed for %s: %s", control_id, e)
 
 
-class ClerkScraper:
-    def __init__(self):
-        self.session = requests.Session()
-        self.session.headers.update({
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                          "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,*/*",
-            "Accept-Language": "en-US,en;q=0.5",
-            "Content-Type": "application/x-www-form-urlencoded",
-        })
-        self._hidden: dict[str,str] = {}
-        self._doc_type_index: dict[str,str] = {}
+async def _check_doctype_via_js(page: Page, checkbox_name: str, value: str):
+    """Check a doc type checkbox by its name attribute."""
+    js = f"""
+    (function() {{
+        var inputs = document.querySelectorAll('input[type="checkbox"]');
+        var found = 0;
+        for (var i = 0; i < inputs.length; i++) {{
+            if (inputs[i].name === '{checkbox_name}' && inputs[i].value === '{value}') {{
+                inputs[i].checked = true;
+                found++;
+            }}
+        }}
+        return found;
+    }})();
+    """
+    try:
+        result = await page.evaluate(js)
+        return result > 0
+    except Exception as e:
+        log.debug("Checkbox JS failed: %s", e)
+        return False
 
-    def _load_page(self) -> BeautifulSoup | None:
-        for attempt in range(RETRY_ATTEMPTS):
-            try:
-                r = self.session.get(CLERK_SEARCH, timeout=20)
-                r.raise_for_status()
-                soup = BeautifulSoup(r.text, "lxml")
-                self._hidden = {
-                    i["name"]: i.get("value","")
-                    for i in soup.find_all("input", {"type":"hidden"})
-                    if i.get("name")
-                }
-                self._doc_type_index = {}
-                for inp in soup.find_all("input", {"type":"checkbox"}):
-                    name = inp.get("name","")
-                    val  = inp.get("value","")
-                    if "dclDocType" in name and val:
-                        self._doc_type_index[val.upper()] = name
-                log.info("Page loaded. Hidden: %d | DocTypes: %d",
-                         len(self._hidden), len(self._doc_type_index))
 
-                # Log the raw HTML of date fields for debugging
-                for inp in soup.find_all("input"):
-                    n = inp.get("name","")
-                    if "date" in n.lower() or "Date" in n:
-                        log.info("DATE FIELD: name=%s type=%s value=%s",
-                                 n, inp.get("type","?"), inp.get("value","")[:50])
+async def scrape_one_doctype(page: Page, doc_values: list[str],
+                              doc_type_index: dict[str,str],
+                              start: str, end: str) -> list[dict]:
+    """Search for specific doc types with date range."""
 
-                return soup
-            except Exception as e:
-                log.warning("Page load attempt %d: %s", attempt+1, e)
-                time.sleep(RETRY_DELAY)
-        return None
+    # Navigate to search page
+    await page.goto(CLERK_SEARCH, wait_until="domcontentloaded", timeout=20000)
+    await asyncio.sleep(1)
 
-    def search(self, doc_values: list[str], start: str, end: str) -> list[dict]:
-        if not self._hidden:
-            if not self._load_page():
-                return []
-
-        payload = dict(self._hidden)
-
-        # Check doc type boxes
-        checked = 0
-        for val in doc_values:
-            fname = self._doc_type_index.get(val.upper())
-            if fname:
-                payload[fname] = val
+    # Check doc type checkboxes via JS
+    checked = 0
+    for val in doc_values:
+        fname = doc_type_index.get(val.upper())
+        if fname:
+            ok = await _check_doctype_via_js(page, fname, val)
+            if ok:
                 checked += 1
+                log.debug("Checked: %s=%s", fname, val)
 
-        if not checked:
-            log.warning("No checkboxes found for %s", doc_values)
-            return []
-
-        # ── Date fields ──
-        # The portal uses Telerik RadDatePicker controls.
-        # These require BOTH the visible text input AND the hidden clientState field.
-        # Field name pattern from logs:
-        #   cphNoMargin_f_ddcDateFiledFrom        (text input, id)
-        #   cphNoMargin_f_ddcDateFiledFrom_clientState (hidden)
-        # ASP.NET postback names use $ instead of _:
-        #   ctl00$cphNoMargin$f$ddcDateFiledFrom
-
-        # Set the visible text fields
-        payload["ctl00$cphNoMargin$f$ddcDateFiledFrom"] = start
-        payload["ctl00$cphNoMargin$f$ddcDateFiledTo"]   = end
-
-        # Set the Telerik RadDatePicker client state hidden fields
-        # These encode the selected date in a specific JSON format
-        payload["cphNoMargin_f_ddcDateFiledFrom_clientState"] = (
-            f'{{"enabled":true,"emptyMessage":"","validationText":"{start}","valueAsString":"{start}",'
-            f'"minDateStr":"1/1/1980 0:0:0","maxDateStr":"1/1/2099 0:0:0","lastSetTextBoxValue":"{start}"}}'
-        )
-        payload["cphNoMargin_f_ddcDateFiledTo_clientState"] = (
-            f'{{"enabled":true,"emptyMessage":"","validationText":"{end}","valueAsString":"{end}",'
-            f'"minDateStr":"1/1/1980 0:0:0","maxDateStr":"1/1/2099 0:0:0","lastSetTextBoxValue":"{end}"}}'
-        )
-
-        # Also set the parent RadDatePicker component states
-        payload["cphNoMargin_f_ddcDateFiledFrom_dateInput_clientState"] = (
-            f'{{"enabled":true,"emptyMessage":"","validationText":"{start}","valueAsString":"{start}",'
-            f'"minDateStr":"1/1/1980 0:0:0","maxDateStr":"1/1/2099 0:0:0","lastSetTextBoxValue":"{start}"}}'
-        )
-        payload["cphNoMargin_f_ddcDateFiledTo_dateInput_clientState"] = (
-            f'{{"enabled":true,"emptyMessage":"","validationText":"{end}","valueAsString":"{end}",'
-            f'"minDateStr":"1/1/1980 0:0:0","maxDateStr":"1/1/2099 0:0:0","lastSetTextBoxValue":"{end}"}}'
-        )
-
-        # Search button
-        payload["ctl00$cphNoMargin$SearchButtons1$btnSearch"] = "Search"
-        payload["__EVENTTARGET"]   = "ctl00$cphNoMargin$SearchButtons1$btnSearch"
-        payload["__EVENTARGUMENT"] = ""
-
-        log.info("Searching %s: %s → %s", doc_values, start, end)
-
-        for attempt in range(RETRY_ATTEMPTS):
-            try:
-                r = self.session.post(CLERK_SEARCH, data=payload,
-                                      timeout=30, allow_redirects=True)
-                r.raise_for_status()
-                final_url = r.url
-                log.info("Response: %d | url: %s", r.status_code, final_url[:80])
-
-                soup = BeautifulSoup(r.text, "lxml")
-                page_text = soup.get_text(separator=" ", strip=True)
-                log.info("Page text (200): %s", page_text[:200])
-
-                # If we're back on SearchEntry, the date POST didn't work
-                if "SearchEntry" in final_url or "Selection Criteria" in page_text[:100]:
-                    log.warning("Got search page back — trying SearchResults direct GET")
-                    # Try direct GET to results page
-                    results = self._try_direct_get(doc_values, start, end)
-                    if results:
-                        return results
-                    # Update hidden fields for next attempt
-                    new_hidden = {i["name"]: i.get("value","")
-                                  for i in soup.find_all("input", {"type":"hidden"})
-                                  if i.get("name")}
-                    if new_hidden:
-                        self._hidden = new_hidden
-                    time.sleep(RETRY_DELAY)
-                    continue
-
-                results = self._parse(soup)
-                log.info("Parsed %d for %s", len(results), doc_values)
-                return results
-
-            except Exception as e:
-                log.warning("Attempt %d failed: %s", attempt+1, e)
-                time.sleep(RETRY_DELAY)
-                self._load_page()
-
+    if not checked:
+        log.warning("Could not check any boxes for %s", doc_values)
         return []
 
-    def _try_direct_get(self, doc_values: list[str], start: str, end: str) -> list[dict]:
-        """
-        Try accessing the SearchResults page directly with URL parameters.
-        Some Telerik portals support GET-based searches.
-        """
-        # Try various URL parameter formats
-        doc_param = doc_values[0] if doc_values else ""
-        urls = [
-            f"{CLERK_BASE}/RealEstate/SearchResults.aspx"
-            f"?DocType={doc_param}&DateFrom={start}&DateTo={end}",
+    # Set date fields via JS (bypasses Telerik's calendar widget requirement)
+    await _set_date_via_js(page, "cphNoMargin_f_ddcDateFiledFrom", start)
+    await _set_date_via_js(page, "cphNoMargin_f_ddcDateFiledTo", end)
 
-            f"{CLERK_BASE}/RealEstate/SearchResults.aspx"
-            f"?docType={doc_param}&startDate={start}&endDate={end}",
+    # Also try direct hidden field injection
+    state_from = _telerik_state(start)
+    state_to   = _telerik_state(end)
+    await page.evaluate(f"""
+    (function() {{
+        // Try all possible hidden field name variants
+        var fields = {{
+            'cphNoMargin_f_ddcDateFiledFrom_ClientState': {json.dumps(state_from)},
+            'cphNoMargin_f_ddcDateFiledTo_ClientState': {json.dumps(state_to)},
+            'cphNoMargin_f_ddcDateFiledFrom_dateInput_ClientState': {json.dumps(state_from)},
+            'cphNoMargin_f_ddcDateFiledTo_dateInput_ClientState': {json.dumps(state_to)},
+        }};
+        for (var id in fields) {{
+            var el = document.getElementById(id);
+            if (el) {{ el.value = fields[id]; }}
+        }}
 
-            f"{CLERK_BASE}/RealEstate/SearchResults.aspx"
-            f"?searchType=DTR&docType={doc_param}&beginDate={start}&endDate={end}",
-        ]
+        // Also set visible text inputs
+        var fromInp = document.getElementById('cphNoMargin_f_ddcDateFiledFrom_dateInput');
+        if (fromInp) fromInp.value = '{start}';
+        var toInp = document.getElementById('cphNoMargin_f_ddcDateFiledTo_dateInput');
+        if (toInp) toInp.value = '{end}';
 
-        for url in urls:
-            try:
-                r = self.session.get(url, timeout=15)
-                soup = BeautifulSoup(r.text, "lxml")
-                text = soup.get_text(separator=" ", strip=True)
-                log.info("Direct GET %s | text: %s", url[-60:], text[:100])
-                results = self._parse(soup)
-                if results:
-                    log.info("Direct GET found %d records!", len(results))
-                    return results
-            except Exception as e:
-                log.debug("Direct GET failed: %s", e)
+        return true;
+    }})();
+    """)
 
+    log.info("  Set dates %s → %s, checked %d boxes", start, end, checked)
+
+    # Click Search button
+    clicked = False
+    for sel in ["#cphNoMargin_SearchButtons1_btnSearch",
+                "input[id*='btnSearch']",
+                "input[value='Search']"]:
+        try:
+            btn = await page.query_selector(sel)
+            if btn:
+                await btn.click()
+                clicked = True
+                log.info("  Clicked search button")
+                break
+        except: pass
+
+    if not clicked:
+        log.warning("  Could not click search button")
         return []
 
-    def _parse(self, soup: BeautifulSoup) -> list[dict]:
-        JUNK = ["get a free copy","sort by","results list","new search",
-                "refine search","0records","please enter","logon","login",
-                "basket","criteria","click here","search ins","combined name",
-                "clear form","select all","view basket","welcome","birth",
-                "death","marriage","selection criteria"]
-        results = []
-        for tbl in soup.find_all("table"):
-            rows = tbl.find_all("tr")
-            if len(rows) < 2: continue
-            hdrs = [th.get_text(strip=True).lower()
-                    for th in rows[0].find_all(["th","td"])]
-            hdr_str = " ".join(hdrs)
-            if not any(x in hdr_str for x in
-                       ["inst","grantor","filed","consideration","book","grantee"]):
-                continue
-            if any(j in hdr_str for j in JUNK): continue
-            log.info("Results table: hdrs=%s rows=%d", hdrs[:8], len(rows)-1)
-            for tr in rows[1:]:
-                cells = tr.find_all("td")
-                if len(cells) < 3: continue
-                row_text = " ".join(c.get_text(strip=True) for c in cells).lower()
-                if any(j in row_text for j in JUNK): continue
-                if len(row_text.strip()) < 5: continue
-                raw = {}
-                for i, cell in enumerate(cells):
-                    k = hdrs[i] if i < len(hdrs) else f"c{i}"
-                    v = cell.get_text(strip=True)
-                    if v: raw[k] = v
-                    a = cell.find("a", href=True)
-                    if a:
-                        href = a["href"]
-                        if not href.startswith("http"):
-                            href = CLERK_BASE + "/" + href.lstrip("/")
-                        raw[k+"_href"] = href
-                results.append(raw)
-        return results
+    # Wait for navigation
+    await asyncio.sleep(2)
+    try:
+        await page.wait_for_load_state("networkidle", timeout=15000)
+    except: pass
+
+    result_url = page.url
+    log.info("  Result URL: %s", result_url)
+
+    # Parse results
+    content = await page.content()
+    soup = BeautifulSoup(content, "lxml")
+    results = _parse_results_table(soup)
+    log.info("  Found %d results for %s", len(results), doc_values)
+    return results
 
 
-def scrape_clerk(start_date: str, end_date: str) -> list[dict]:
-    scraper = ClerkScraper()
-    if not scraper._load_page():
-        return []
+def _parse_results_table(soup: BeautifulSoup) -> list[dict]:
+    JUNK = ["get a free copy","sort by","results list","new search","refine search",
+            "0records","please enter","logon","login","basket","criteria",
+            "click here","search ins","combined name","clear form","select all",
+            "view basket","welcome","birth","death","marriage","selection criteria",
+            "fort bend county texas"]
+    results = []
+    for tbl in soup.find_all("table"):
+        rows = tbl.find_all("tr")
+        if len(rows) < 2: continue
+        hdrs = [th.get_text(strip=True).lower()
+                for th in rows[0].find_all(["th","td"])]
+        hdr_str = " ".join(hdrs)
+        if not any(x in hdr_str for x in
+                   ["inst","grantor","filed","consideration","book","grantee"]):
+            continue
+        if any(j in hdr_str for j in JUNK): continue
+        log.info("  Results table: hdrs=%s rows=%d", hdrs[:8], len(rows)-1)
+        for tr in rows[1:]:
+            cells = tr.find_all("td")
+            if len(cells) < 3: continue
+            row_text = " ".join(c.get_text(strip=True) for c in cells).lower()
+            if any(j in row_text for j in JUNK): continue
+            if len(row_text.strip()) < 5: continue
+            raw = {}
+            for i, cell in enumerate(cells):
+                k = hdrs[i] if i < len(hdrs) else f"c{i}"
+                v = cell.get_text(strip=True)
+                if v: raw[k] = v
+                a = cell.find("a", href=True)
+                if a:
+                    href = a["href"]
+                    if not href.startswith("http"):
+                        href = CLERK_BASE + "/" + href.lstrip("/")
+                    raw[k+"_href"] = href
+            results.append(raw)
+    return results
+
+
+async def scrape_clerk(start_date: str, end_date: str) -> list[dict]:
+    if not HAS_PLAYWRIGHT:
+        log.warning("Playwright not available"); return []
 
     records = []
-    searched: set[tuple] = set()
 
-    for doc_code, (cat, label, portal_vals) in DOC_TYPE_MAP.items():
-        combo = tuple(sorted(portal_vals))
-        if combo in searched:
-            continue
-        searched.add(combo)
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=HEADLESS)
+        ctx = await browser.new_context(
+            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            viewport={"width":1280,"height":900}
+        )
+        page = await ctx.new_page()
 
-        log.info("Searching: %s (%s)", doc_code, portal_vals)
-        raw_rows = scraper.search(portal_vals, start_date, end_date)
-        for row in raw_rows:
-            row["_code"] = doc_code
-            rec = _make_record(row)
-            if rec:
-                records.append(rec)
+        # Load search page and extract doc type checkbox index
+        log.info("Loading search page ...")
+        await page.goto(CLERK_SEARCH, wait_until="domcontentloaded", timeout=30000)
+        await asyncio.sleep(2)
+
+        content = await page.content()
+        soup = BeautifulSoup(content, "lxml")
+        doc_type_index: dict[str,str] = {}
+        for inp in soup.find_all("input", {"type":"checkbox"}):
+            name = inp.get("name","")
+            val  = inp.get("value","")
+            if "dclDocType" in name and val:
+                doc_type_index[val.upper()] = name
+
+        log.info("Doc type index: %d entries. Sample: %s",
+                 len(doc_type_index),
+                 list(doc_type_index.items())[:5])
+
+        # Search unique combos
+        searched: set[tuple] = set()
+        for doc_code, (cat, label, portal_vals) in DOC_TYPE_MAP.items():
+            combo = tuple(sorted(portal_vals))
+            if combo in searched:
+                continue
+            searched.add(combo)
+
+            log.info("Searching %s (%s)", doc_code, portal_vals)
+            for attempt in range(RETRY_ATTEMPTS):
+                try:
+                    raw_rows = await scrape_one_doctype(
+                        page, portal_vals, doc_type_index, start_date, end_date)
+                    for row in raw_rows:
+                        row["_code"] = doc_code
+                        rec = _make_record(row)
+                        if rec:
+                            records.append(rec)
+                    break
+                except Exception as e:
+                    log.warning("  Attempt %d failed: %s", attempt+1, e)
+                    await asyncio.sleep(RETRY_DELAY)
+
+        await browser.close()
 
     log.info("Clerk done: %d records", len(records))
     return records
@@ -564,7 +586,7 @@ def write_csv(records, out_dir):
                 "Public Records URL":rec.get("clerk_url","")})
     log.info("CSV -> %s (%d rows)", p, len(records))
 
-def main():
+async def main():
     end_dt   = datetime.now(timezone.utc)
     start_dt = end_dt - timedelta(days=LOOKBACK_DAYS)
     s = start_dt.strftime("%m/%d/%Y")
@@ -575,7 +597,7 @@ def main():
     try: parcel.build()
     except Exception as ex: log.warning("Parcel failed: %s", ex)
 
-    records = scrape_clerk(s, e)
+    records = await scrape_clerk(s, e)
     records = enrich(dedup(score_all(records)), parcel)
     records = score_all(records)
 
@@ -593,4 +615,4 @@ def main():
     log.info("Done. Total:%d  With address:%d", payload["total"], payload["with_address"])
 
 if __name__=="__main__":
-    main()
+    asyncio.run(main())

@@ -1,8 +1,6 @@
 """
 Fort Bend County, TX — Motivated Seller Lead Scraper
 Direct HTTP POST to ccweb.co.fort-bend.tx.us
-Doc type checkboxes: ctl00$cphNoMargin$f$dclDocType$N (value=LISPEN, LIEN, etc.)
-Date fields: ctl00$cphNoMargin$f$ddcDateFiledFrom / ddcDateFiledTo
 """
 from __future__ import annotations
 import csv, io, json, logging, os, re, time, zipfile
@@ -25,18 +23,6 @@ LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "7"))
 CLERK_BASE   = "http://ccweb.co.fort-bend.tx.us"
 CLERK_SEARCH = "http://ccweb.co.fort-bend.tx.us/RealEstate/SearchEntry.aspx"
 FBCAD_URL    = "https://www.fbcad.org/data-files/"
-
-# Map our codes to the portal's checkbox values (from image 3 log)
-# Values seen: ABANDON, AJ, AFFDVT, AGREEMNT, AMENDMNT, ANNEX, APPLICTN,
-# APPOINT, ARTICLES, ASSIGNMT, ASSUMED, BANKRUPT, BOS, BOND, BRAND, CERT,
-# CONSENT, CONTRACT, CORRECT, COURTREC, DEDICATE, DEED, DTRUST, DEPUTA,
-# DESIGNAT, DISCHRGE, DISCLOSURE, EASEMENT, ENCROACH, ESTRAY, EXTENSON,
-# FEDLIEN, CONCLU LAW, GRANT, HEIRSHIP, HOMEEQUITY, HOME, JUDGE, LEASE,
-# LICENSE, LIEN, LISPEN, MASTERD, MEMO, MERGER, MISC, MOD, NOTICE, OATH,
-# OILGAS, ORDER, ORD, PARTREL, PETITION, PLAT, PLAT ATTACH, POWER, RATIFY,
-# REJECT, RELEASE, RFL, ROB, RSL, RESCISSION, RESIGN, RES, RESTRICT, ROW,
-# STLIEN, SUB, SFL, TRANSFER, TRUST, UCC1NSOP, UCC3OPR, UCC1OPR, UCC3NSOP,
-# UTILITY, VARIANCE, VITAL, VOID, WITHDRAW, WFL, WDBA, WDBAN
 
 DOC_TYPE_MAP = {
     "LP":       ("LP",      "Lis Pendens",                  ["LISPEN"]),
@@ -210,152 +196,202 @@ def compute_score(rec):
         flags.append("LLC / corp owner"); score+=10
     return min(score,100), flags
 
-# ── Clerk scraper — direct HTTP POST ─────────────────────────────────────────
+# ── Clerk scraper ─────────────────────────────────────────────────────────────
+
+def _make_date_client_state(date_str: str) -> str:
+    """
+    Build the Telerik RadDatePicker clientState JSON string.
+    Format: {"minDate":"1/1/1980","maxDate":"1/1/2099","selectedDate":"MM/DD/YYYY","focused":true}
+    """
+    return (f'{{"minDate":"1/1/1980","maxDate":"1/1/2099",'
+            f'"selectedDate":"{date_str}","focused":false}}')
+
 
 class ClerkScraper:
-    """
-    Scrapes Fort Bend County Clerk portal via direct HTTP POST.
-
-    Form mechanics (confirmed from log analysis):
-    - Doc type: checkboxes  ctl00$cphNoMargin$f$dclDocType$N  value=LISPEN etc.
-    - Date from: ctl00$cphNoMargin$f$ddcDateFiledFrom  (MM/DD/YYYY)
-    - Date to:   ctl00$cphNoMargin$f$ddcDateFiledTo    (MM/DD/YYYY)
-    - Search btn: ctl00$cphNoMargin$SearchButtons1$btnSearch
-    """
-
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                           "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept": "text/html,application/xhtml+xml,*/*",
             "Accept-Language": "en-US,en;q=0.5",
+            "Content-Type": "application/x-www-form-urlencoded",
         })
         self._hidden: dict[str,str] = {}
-        self._doc_type_index: dict[str,str] = {}  # value -> field name
+        self._doc_type_index: dict[str,str] = {}
 
-    def _get_search_page(self) -> BeautifulSoup | None:
-        """GET the search page and extract hidden fields + doc type checkboxes."""
+    def _load_page(self) -> BeautifulSoup | None:
         for attempt in range(RETRY_ATTEMPTS):
             try:
                 r = self.session.get(CLERK_SEARCH, timeout=20)
                 r.raise_for_status()
                 soup = BeautifulSoup(r.text, "lxml")
-
-                # Extract all hidden fields
                 self._hidden = {
                     i["name"]: i.get("value","")
                     for i in soup.find_all("input", {"type":"hidden"})
                     if i.get("name")
                 }
-
-                # Extract doc type checkboxes
                 self._doc_type_index = {}
                 for inp in soup.find_all("input", {"type":"checkbox"}):
                     name = inp.get("name","")
                     val  = inp.get("value","")
                     if "dclDocType" in name and val:
                         self._doc_type_index[val.upper()] = name
-
-                log.info("Search page loaded. Hidden fields: %d | Doc type checkboxes: %d",
+                log.info("Page loaded. Hidden: %d | DocTypes: %d",
                          len(self._hidden), len(self._doc_type_index))
-                log.info("Available doc types: %s",
-                         sorted(self._doc_type_index.keys()))
-                return soup
 
+                # Log the raw HTML of date fields for debugging
+                for inp in soup.find_all("input"):
+                    n = inp.get("name","")
+                    if "date" in n.lower() or "Date" in n:
+                        log.info("DATE FIELD: name=%s type=%s value=%s",
+                                 n, inp.get("type","?"), inp.get("value","")[:50])
+
+                return soup
             except Exception as e:
-                log.warning("GET attempt %d failed: %s", attempt+1, e)
+                log.warning("Page load attempt %d: %s", attempt+1, e)
                 time.sleep(RETRY_DELAY)
         return None
 
     def search(self, doc_values: list[str], start: str, end: str) -> list[dict]:
-        """
-        POST a search for given doc type values (e.g. ['LISPEN']) and date range.
-        Returns list of raw record dicts.
-        """
         if not self._hidden:
-            if not self._get_search_page():
+            if not self._load_page():
                 return []
 
-        # Build payload
         payload = dict(self._hidden)
 
-        # Add doc type checkboxes
-        checked_any = False
+        # Check doc type boxes
+        checked = 0
         for val in doc_values:
-            field_name = self._doc_type_index.get(val.upper())
-            if field_name:
-                payload[field_name] = val
-                checked_any = True
-                log.debug("Checking doc type: %s = %s", field_name, val)
-            else:
-                log.warning("Doc type '%s' not found in checkbox index", val)
+            fname = self._doc_type_index.get(val.upper())
+            if fname:
+                payload[fname] = val
+                checked += 1
 
-        if not checked_any:
-            log.warning("No doc types found for %s — skipping", doc_values)
+        if not checked:
+            log.warning("No checkboxes found for %s", doc_values)
             return []
 
-        # Date fields — the ASP.NET date picker uses a special format
-        # Try both the client state hidden field and the visible text field
+        # ── Date fields ──
+        # The portal uses Telerik RadDatePicker controls.
+        # These require BOTH the visible text input AND the hidden clientState field.
+        # Field name pattern from logs:
+        #   cphNoMargin_f_ddcDateFiledFrom        (text input, id)
+        #   cphNoMargin_f_ddcDateFiledFrom_clientState (hidden)
+        # ASP.NET postback names use $ instead of _:
+        #   ctl00$cphNoMargin$f$ddcDateFiledFrom
+
+        # Set the visible text fields
         payload["ctl00$cphNoMargin$f$ddcDateFiledFrom"] = start
         payload["ctl00$cphNoMargin$f$ddcDateFiledTo"]   = end
 
+        # Set the Telerik RadDatePicker client state hidden fields
+        # These encode the selected date in a specific JSON format
+        payload["cphNoMargin_f_ddcDateFiledFrom_clientState"] = (
+            f'{{"enabled":true,"emptyMessage":"","validationText":"{start}","valueAsString":"{start}",'
+            f'"minDateStr":"1/1/1980 0:0:0","maxDateStr":"1/1/2099 0:0:0","lastSetTextBoxValue":"{start}"}}'
+        )
+        payload["cphNoMargin_f_ddcDateFiledTo_clientState"] = (
+            f'{{"enabled":true,"emptyMessage":"","validationText":"{end}","valueAsString":"{end}",'
+            f'"minDateStr":"1/1/1980 0:0:0","maxDateStr":"1/1/2099 0:0:0","lastSetTextBoxValue":"{end}"}}'
+        )
+
+        # Also set the parent RadDatePicker component states
+        payload["cphNoMargin_f_ddcDateFiledFrom_dateInput_clientState"] = (
+            f'{{"enabled":true,"emptyMessage":"","validationText":"{start}","valueAsString":"{start}",'
+            f'"minDateStr":"1/1/1980 0:0:0","maxDateStr":"1/1/2099 0:0:0","lastSetTextBoxValue":"{start}"}}'
+        )
+        payload["cphNoMargin_f_ddcDateFiledTo_dateInput_clientState"] = (
+            f'{{"enabled":true,"emptyMessage":"","validationText":"{end}","valueAsString":"{end}",'
+            f'"minDateStr":"1/1/1980 0:0:0","maxDateStr":"1/1/2099 0:0:0","lastSetTextBoxValue":"{end}"}}'
+        )
+
         # Search button
         payload["ctl00$cphNoMargin$SearchButtons1$btnSearch"] = "Search"
-
-        # Also set the event target/argument for the button
-        payload["__EVENTTARGET"]   = ""
+        payload["__EVENTTARGET"]   = "ctl00$cphNoMargin$SearchButtons1$btnSearch"
         payload["__EVENTARGUMENT"] = ""
 
-        log.info("POSTing search for %s, dates %s-%s", doc_values, start, end)
+        log.info("Searching %s: %s → %s", doc_values, start, end)
 
         for attempt in range(RETRY_ATTEMPTS):
             try:
                 r = self.session.post(CLERK_SEARCH, data=payload,
-                                       timeout=30, allow_redirects=True)
+                                      timeout=30, allow_redirects=True)
                 r.raise_for_status()
-                log.info("POST response: %d | url: %s", r.status_code,
-                         r.url[:80])
+                final_url = r.url
+                log.info("Response: %d | url: %s", r.status_code, final_url[:80])
 
                 soup = BeautifulSoup(r.text, "lxml")
-
-                # Check for results
                 page_text = soup.get_text(separator=" ", strip=True)
-                log.info("Result page text (first 200): %s", page_text[:200])
+                log.info("Page text (200): %s", page_text[:200])
 
-                results = self._parse_results(soup)
-                log.info("Parsed %d records for %s", len(results), doc_values)
-
-                # If we got redirected to the same page with "0 records", refresh hidden fields
-                if not results and "SearchEntry" in r.url:
-                    new_hidden = {
-                        i["name"]: i.get("value","")
-                        for i in soup.find_all("input", {"type":"hidden"})
-                        if i.get("name")
-                    }
-                    if new_hidden.get("__VIEWSTATE","") != self._hidden.get("__VIEWSTATE",""):
+                # If we're back on SearchEntry, the date POST didn't work
+                if "SearchEntry" in final_url or "Selection Criteria" in page_text[:100]:
+                    log.warning("Got search page back — trying SearchResults direct GET")
+                    # Try direct GET to results page
+                    results = self._try_direct_get(doc_values, start, end)
+                    if results:
+                        return results
+                    # Update hidden fields for next attempt
+                    new_hidden = {i["name"]: i.get("value","")
+                                  for i in soup.find_all("input", {"type":"hidden"})
+                                  if i.get("name")}
+                    if new_hidden:
                         self._hidden = new_hidden
-                        log.info("Updated hidden fields after redirect")
+                    time.sleep(RETRY_DELAY)
+                    continue
 
+                results = self._parse(soup)
+                log.info("Parsed %d for %s", len(results), doc_values)
                 return results
 
             except Exception as e:
-                log.warning("POST attempt %d failed: %s", attempt+1, e)
+                log.warning("Attempt %d failed: %s", attempt+1, e)
                 time.sleep(RETRY_DELAY)
-                # Refresh hidden fields
-                self._get_search_page()
+                self._load_page()
 
         return []
 
-    def _parse_results(self, soup: BeautifulSoup) -> list[dict]:
+    def _try_direct_get(self, doc_values: list[str], start: str, end: str) -> list[dict]:
+        """
+        Try accessing the SearchResults page directly with URL parameters.
+        Some Telerik portals support GET-based searches.
+        """
+        # Try various URL parameter formats
+        doc_param = doc_values[0] if doc_values else ""
+        urls = [
+            f"{CLERK_BASE}/RealEstate/SearchResults.aspx"
+            f"?DocType={doc_param}&DateFrom={start}&DateTo={end}",
+
+            f"{CLERK_BASE}/RealEstate/SearchResults.aspx"
+            f"?docType={doc_param}&startDate={start}&endDate={end}",
+
+            f"{CLERK_BASE}/RealEstate/SearchResults.aspx"
+            f"?searchType=DTR&docType={doc_param}&beginDate={start}&endDate={end}",
+        ]
+
+        for url in urls:
+            try:
+                r = self.session.get(url, timeout=15)
+                soup = BeautifulSoup(r.text, "lxml")
+                text = soup.get_text(separator=" ", strip=True)
+                log.info("Direct GET %s | text: %s", url[-60:], text[:100])
+                results = self._parse(soup)
+                if results:
+                    log.info("Direct GET found %d records!", len(results))
+                    return results
+            except Exception as e:
+                log.debug("Direct GET failed: %s", e)
+
+        return []
+
+    def _parse(self, soup: BeautifulSoup) -> list[dict]:
         JUNK = ["get a free copy","sort by","results list","new search",
                 "refine search","0records","please enter","logon","login",
                 "basket","criteria","click here","search ins","combined name",
-                "clear form","june 2026","may 2026","july 2026","april 2026",
-                "march 2026","select all","view basket","welcome","birth",
-                "death","marriage"]
+                "clear form","select all","view basket","welcome","birth",
+                "death","marriage","selection criteria"]
         results = []
-
         for tbl in soup.find_all("table"):
             rows = tbl.find_all("tr")
             if len(rows) < 2: continue
@@ -365,18 +401,14 @@ class ClerkScraper:
             if not any(x in hdr_str for x in
                        ["inst","grantor","filed","consideration","book","grantee"]):
                 continue
-            if any(j in hdr_str for j in JUNK):
-                continue
-
-            log.info("Results table found: hdrs=%s rows=%d", hdrs[:8], len(rows)-1)
-
+            if any(j in hdr_str for j in JUNK): continue
+            log.info("Results table: hdrs=%s rows=%d", hdrs[:8], len(rows)-1)
             for tr in rows[1:]:
                 cells = tr.find_all("td")
                 if len(cells) < 3: continue
                 row_text = " ".join(c.get_text(strip=True) for c in cells).lower()
                 if any(j in row_text for j in JUNK): continue
                 if len(row_text.strip()) < 5: continue
-
                 raw = {}
                 for i, cell in enumerate(cells):
                     k = hdrs[i] if i < len(hdrs) else f"c{i}"
@@ -389,31 +421,25 @@ class ClerkScraper:
                             href = CLERK_BASE + "/" + href.lstrip("/")
                         raw[k+"_href"] = href
                 results.append(raw)
-
         return results
 
 
 def scrape_clerk(start_date: str, end_date: str) -> list[dict]:
     scraper = ClerkScraper()
-    if not scraper._get_search_page():
-        log.warning("Could not load search page")
+    if not scraper._load_page():
         return []
 
     records = []
-
-    # Group doc codes by their portal checkbox values to avoid duplicate searches
-    searched_combos: set[tuple] = set()
+    searched: set[tuple] = set()
 
     for doc_code, (cat, label, portal_vals) in DOC_TYPE_MAP.items():
         combo = tuple(sorted(portal_vals))
-        if combo in searched_combos:
-            # Still add records from cache if we already searched this combo
+        if combo in searched:
             continue
-        searched_combos.add(combo)
+        searched.add(combo)
 
         log.info("Searching: %s (%s)", doc_code, portal_vals)
         raw_rows = scraper.search(portal_vals, start_date, end_date)
-
         for row in raw_rows:
             row["_code"] = doc_code
             rec = _make_record(row)
@@ -427,7 +453,8 @@ def scrape_clerk(start_date: str, end_date: str) -> list[dict]:
 def _make_record(raw: dict) -> dict | None:
     try:
         code = raw.get("_code","")
-        cat, label, _ = DOC_TYPE_MAP.get(code,(code,code,[]))
+        info = DOC_TYPE_MAP.get(code,(code,code,[]))
+        cat, label = info[0], info[1]
 
         def g(*ks):
             for k in ks:

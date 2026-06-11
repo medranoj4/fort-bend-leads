@@ -1,11 +1,12 @@
 """
 Fort Bend County, TX — Motivated Seller Lead Scraper
+Clerk: ccweb.co.fort-bend.tx.us (Kofile portal)
+Parcel: FBCAD OwnerExport.txt + PropertyExport.txt
 """
 from __future__ import annotations
 import asyncio, csv, io, json, logging, os, re, time, zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
 import requests
 from bs4 import BeautifulSoup
 
@@ -29,10 +30,6 @@ HEADLESS      = os.getenv("HEADLESS", "true").lower() != "false"
 
 CLERK_BASE = "https://ccweb.co.fort-bend.tx.us"
 FBCAD_URL  = "https://www.fbcad.org/data-files/"
-
-# Target ZIP: April 2024 Residential Segments (confirmed to have OwnerExport)
-# We'll pick the best ZIP automatically based on content
-PREFERRED_ZIP_KEYWORDS = ["ownerexport", "owner_export", "ownerfile", "owner-"]
 
 DOC_TYPE_MAP = {
     "LP":("LP","Lis Pendens"), "NOFC":("NOFC","Notice of Foreclosure"),
@@ -66,6 +63,11 @@ def parse_name(full):
     return (t[0].title(), " ".join(t[1:]).title()) if len(t)>1 else ("",t[0].title())
 
 # ── Parcel lookup ─────────────────────────────────────────────────────────────
+# Confirmed column names from log line 18-19:
+# Property: RecordType, PropertyQuickRefID, PropertyNumber, SitusStreetAddress,
+#           SitusCity, SitusState, SitusZip, LegalDesc
+# Owner:    RecordType, PropertyQuickRefID, OwnerName, OwnerAddress1,
+#           OwnerAddress2, OwnerAddress3, OwnerCity, OwnerState, OwnerPostalCode
 
 class ParcelLookup:
     def __init__(self): self._idx: dict[str,dict] = {}
@@ -95,27 +97,35 @@ class ParcelLookup:
                     if not h.startswith("http"): h = "https://www.fbcad.org"+h
                     zips.append(h)
 
-            # Try the most recent ZIPs that contain owner+property data
-            # Based on log: ZIPs with OwnerExport.txt + PropertyExport.txt are what we want
-            good_zips = [z for z in zips if not any(x in z.lower()
-                         for x in ("segment","commercial","residential","agent","entity",
-                                   "exemption","mobile","sales","improvement","land",
-                                   "grandtotal","prelim","certified"))]
-            try_order = good_zips[:5] + zips[:10]  # good ones first, fallback to first 10
+            # Prefer ZIPs that have "Supplement" or "Export" and are recent (2025 first)
+            def score_zip(url):
+                u = url.lower()
+                s = 0
+                if "2025" in u: s += 100
+                if "2024" in u: s += 50
+                if "supplement" in u: s += 20
+                if "export" in u and "redact" not in u: s += 30
+                if any(x in u for x in ("segment","commercial","residential","sales",
+                                         "improvement","land","grandtotal","prelim",
+                                         "agent","entity","exemption","mobile")): s -= 50
+                return s
 
-            for url in try_order:
+            zips_sorted = sorted(zips, key=score_zip, reverse=True)
+            log.info("Will try %d ZIPs, top 3: %s", len(zips_sorted),
+                     [z.split("/")[-1] for z in zips_sorted[:3]])
+
+            for url in zips_sorted[:8]:
                 try:
-                    log.info("Trying ZIP: %s", url.split("/")[-1])
+                    log.info("Trying: %s", url.split("/")[-1])
                     r2 = requests.get(url, timeout=120); r2.raise_for_status()
                     count = self._load_zip(r2.content)
                     if count > 0:
-                        log.info("SUCCESS: Parcel index built with %d entries", len(self._idx))
+                        log.info("Parcel index: %d entries", len(self._idx))
                         return self
                 except Exception as e:
-                    log.warning("ZIP failed (%s): %s", url.split("/")[-1], e)
-
+                    log.warning("ZIP failed: %s", e)
         except Exception as e:
-            log.warning("FBCAD fetch failed: %s", e)
+            log.warning("FBCAD failed: %s", e)
         log.warning("Parcel lookup unavailable")
         return self
 
@@ -123,104 +133,61 @@ class ParcelLookup:
         count = 0
         with zipfile.ZipFile(io.BytesIO(raw)) as zf:
             names = zf.namelist()
-            log.info("ZIP has %d files, first few: %s", len(names), names[:5])
-
-            # Find the Owner file (txt or csv) — look for "owner" in filename
             owner_files = [n for n in names if "owner" in n.lower()
                            and n.lower().endswith((".txt",".csv"))]
-            # Find the Property/Situs file for addresses
-            prop_files  = [n for n in names if any(x in n.lower() for x in ("property","situs","prop"))
+            prop_files  = [n for n in names if "property" in n.lower()
                            and n.lower().endswith((".txt",".csv"))]
 
-            log.info("Owner files: %s | Property files: %s", owner_files, prop_files)
-
             if not owner_files:
-                # Fall back: try every txt/csv file and log column names
-                all_text = [n for n in names if n.lower().endswith((".txt",".csv"))]
-                for fn in all_text[:3]:
-                    try:
-                        sample = zf.read(fn).decode("latin-1",errors="replace")
-                        first_line = sample.split("\n")[0]
-                        log.info("File %s columns: %s", fn, first_line[:200])
-                    except: pass
                 return 0
 
-            # Build account→address map from property file first
-            addr_map: dict[str, dict] = {}
+            # Load property file → account# to situs address map
+            addr_map: dict[str,dict] = {}
             if prop_files:
                 try:
                     raw_csv = zf.read(prop_files[0]).decode("latin-1",errors="replace")
-                    reader  = csv.DictReader(io.StringIO(raw_csv),
-                                             delimiter=self._detect_delim(raw_csv))
-                    cols = reader.fieldnames or []
-                    log.info("Property file columns: %s", cols[:15])
+                    delim   = "\t" if raw_csv.split("\n")[0].count("\t") > raw_csv.split("\n")[0].count(",") else ","
+                    reader  = csv.DictReader(io.StringIO(raw_csv), delimiter=delim)
                     for row in reader:
-                        acct = self._fv(row,"acct","account","prop_id","parcel")
+                        # Use confirmed column names
+                        acct = row.get("PropertyQuickRefID","") or row.get("PropertyNumber","")
                         if not acct: continue
-                        addr_map[acct] = {
-                            "site_addr":  self._fv(row,"situs_addr","site_addr","prop_addr","address","situs","addr"),
-                            "site_city":  self._fv(row,"situs_city","site_city","prop_city","city"),
-                            "site_zip":   self._fv(row,"situs_zip","site_zip","prop_zip","zip","zipcode"),
+                        addr_map[str(acct).strip()] = {
+                            "site_addr": row.get("SitusStreetAddress","").strip(),
+                            "site_city": row.get("SitusCity","").strip(),
+                            "site_zip":  row.get("SitusZip","").strip(),
                         }
+                    log.info("Loaded %d property records", len(addr_map))
                 except Exception as e:
                     log.warning("Property file error: %s", e)
 
-            # Parse owner file
+            # Load owner file
             try:
                 raw_csv = zf.read(owner_files[0]).decode("latin-1",errors="replace")
-                reader  = csv.DictReader(io.StringIO(raw_csv),
-                                         delimiter=self._detect_delim(raw_csv))
-                cols = reader.fieldnames or []
-                log.info("Owner file columns: %s", cols[:20])
-
+                delim   = "\t" if raw_csv.split("\n")[0].count("\t") > raw_csv.split("\n")[0].count(",") else ","
+                reader  = csv.DictReader(io.StringIO(raw_csv), delimiter=delim)
                 for row in reader:
-                    # Find owner name column
-                    owner = self._fv(row,
-                        "owner_name","ownername","name","owner1","owner",
-                        "dba_name","last_name")
-                    acct  = self._fv(row,"acct","account","prop_id","parcel")
-                    mail_addr  = self._fv(row,"mail_addr","mailing_addr","addr1","address1","addr_1","mail_street")
-                    mail_city  = self._fv(row,"mail_city","mailing_city","city")
-                    mail_state = self._fv(row,"mail_state","mailing_state","state")
-                    mail_zip   = self._fv(row,"mail_zip","mailing_zip","zip","zipcode")
-
-                    site = addr_map.get(acct, {})
+                    # Confirmed columns: OwnerName, PropertyQuickRefID,
+                    # OwnerAddress1, OwnerCity, OwnerState, OwnerPostalCode
+                    owner = row.get("OwnerName","").strip()
+                    if not owner: continue
+                    acct  = str(row.get("PropertyQuickRefID","")).strip()
+                    site  = addr_map.get(acct, {})
                     parcel = {
                         "site_addr":  site.get("site_addr",""),
                         "site_city":  site.get("site_city",""),
                         "site_zip":   site.get("site_zip",""),
-                        "mail_addr":  mail_addr,
-                        "mail_city":  mail_city,
-                        "mail_state": mail_state,
-                        "mail_zip":   mail_zip,
+                        "mail_addr":  row.get("OwnerAddress1","").strip(),
+                        "mail_city":  row.get("OwnerCity","").strip(),
+                        "mail_state": row.get("OwnerState","").strip(),
+                        "mail_zip":   row.get("OwnerPostalCode","").strip(),
                     }
                     self._add(parcel, owner)
                     count += 1
-
                 log.info("Loaded %d owner records", count)
             except Exception as e:
                 log.warning("Owner file error: %s", e)
-
         return count
-
-    def _detect_delim(self, text):
-        first = text.split("\n")[0] if "\n" in text else text[:500]
-        return "\t" if first.count("\t") > first.count(",") else ","
-
-    def _fv(self, row: dict, *keys) -> str:
-        """Find value in row by checking multiple possible column names."""
-        for k in keys:
-            for col in row:
-                if col.lower().replace(" ","_").replace("-","_") == k.lower().replace(" ","_").replace("-","_"):
-                    v = row[col]
-                    if v and str(v).strip(): return str(v).strip()
-        # Partial match fallback
-        for k in keys:
-            for col in row:
-                if k.lower() in col.lower():
-                    v = row[col]
-                    if v and str(v).strip(): return str(v).strip()
-        return ""
 
     def lookup(self, owner):
         n = self._norm(owner)
@@ -236,7 +203,9 @@ class ParcelLookup:
 def compute_score(rec):
     flags, score = [], 30
     cat, dtype = rec.get("cat",""), rec.get("doc_type","")
-    amt, owner, filed = safe_float(rec.get("amount")), str(rec.get("owner","")), str(rec.get("filed",""))
+    amt   = safe_float(rec.get("amount"))
+    owner = str(rec.get("owner",""))
+    filed = str(rec.get("filed",""))
     if cat=="LP":    flags.append("Lis pendens");      score+=10
     if cat=="NOFC":  flags.append("Pre-foreclosure");  score+=10
     if cat=="JUD":   flags.append("Judgment lien");    score+=10
@@ -259,10 +228,6 @@ def compute_score(rec):
 # ── Clerk scraper ─────────────────────────────────────────────────────────────
 
 async def scrape_clerk(start_date: str, end_date: str) -> list[dict]:
-    """
-    Fort Bend County Clerk uses Kofile/ccweb portal.
-    We use Playwright to navigate and scrape the OPR search.
-    """
     if not HAS_PLAYWRIGHT:
         log.warning("Playwright not available"); return []
 
@@ -272,38 +237,48 @@ async def scrape_clerk(start_date: str, end_date: str) -> list[dict]:
         ctx = await browser.new_context(
             user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 800}
+            viewport={"width":1280,"height":800}
         )
         page = await ctx.new_page()
 
-        # Navigate to search page and establish session
         log.info("Loading clerk portal ...")
-        loaded = False
-        for url in [
-            CLERK_BASE + "/recorder/web/login.jsp",
-            CLERK_BASE + "/recorder/web/docSearch.jsp",
-            CLERK_BASE,
-        ]:
-            try:
-                resp = await page.goto(url, wait_until="domcontentloaded", timeout=20000)
-                if resp and resp.status < 400:
-                    log.info("Portal loaded: %s (status %d)", url, resp.status)
-                    loaded = True
-                    break
-            except Exception as e:
-                log.warning("Could not load %s: %s", url, e)
+        try:
+            await page.goto(CLERK_BASE+"/recorder/web/login.jsp",
+                            wait_until="domcontentloaded", timeout=20000)
+            await asyncio.sleep(1)
+        except Exception: pass
 
-        if not loaded:
-            log.warning("Could not reach clerk portal")
-            await browser.close()
-            return []
+        # Navigate to search page
+        try:
+            await page.goto(CLERK_BASE+"/recorder/web/docSearch.jsp",
+                            wait_until="domcontentloaded", timeout=20000)
+            await asyncio.sleep(2)
+        except Exception as e:
+            log.warning("Could not load search page: %s", e)
+            await browser.close(); return []
 
-        await asyncio.sleep(2)
+        log.info("Portal title: %s | URL: %s", await page.title(), page.url)
 
-        # Check what page we actually got
+        # Dump the page HTML so we can see the actual form fields
         content = await page.content()
-        log.info("Portal page title: %s", await page.title())
+        soup = BeautifulSoup(content, "lxml")
 
+        # Log all form fields to understand the search form
+        forms = soup.find_all("form")
+        log.info("Found %d form(s) on search page", len(forms))
+        for i, form in enumerate(forms):
+            inputs = form.find_all(["input","select"])
+            log.info("Form %d action=%s fields=%s", i,
+                     form.get("action",""),
+                     [(el.get("name",""),el.get("type",""),el.get("value",""))
+                      for el in inputs[:10]])
+
+        # Also log any select options for doc type
+        for sel in soup.find_all("select"):
+            opts = [o.get("value","") for o in sel.find_all("option")]
+            log.info("Select name=%s options=%s", sel.get("name","?"), opts[:20])
+
+        # Try submitting the search form via Playwright
         for doc_code in TARGET_CODES:
             log.info("Searching: %s", doc_code)
             rows = []
@@ -322,51 +297,87 @@ async def scrape_clerk(start_date: str, end_date: str) -> list[dict]:
 
 
 async def _kofile_search(page: Page, doc_code: str, start: str, end: str) -> list[dict]:
+    """
+    Try multiple search URL formats used by Kofile/Tyler portals.
+    Dates in MM/DD/YYYY format.
+    """
     results = []
 
-    # Fort Bend Kofile search URL format
-    url = (f"{CLERK_BASE}/recorder/web/docSearch.jsp"
-           f"?searchType=DTR&docType={doc_code}"
-           f"&beginDate={start}&endDate={end}&submit=Search")
+    # Format 1: Standard Kofile OPR search
+    urls_to_try = [
+        (f"{CLERK_BASE}/recorder/web/docSearch.jsp"
+         f"?searchType=DTR&RecordType=OPR"
+         f"&docType={doc_code}&beginDate={start}&endDate={end}&submit=Search"),
 
-    try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-        await asyncio.sleep(1)
-    except Exception as e:
-        log.warning("Navigation error for %s: %s", doc_code, e)
-        return []
+        # Format 2: Without RecordType
+        (f"{CLERK_BASE}/recorder/web/docSearch.jsp"
+         f"?searchType=DTR"
+         f"&docType={doc_code}&beginDate={start}&endDate={end}&submit=Search"),
 
-    content = await page.content()
-    current_url = page.url
-    title = await page.title()
+        # Format 3: instrument type search
+        (f"{CLERK_BASE}/recorder/web/docSearch.jsp"
+         f"?searchType=ITR"
+         f"&instrumentType={doc_code}&startDate={start}&endDate={end}&submit=Search"),
+    ]
 
-    # If we hit a login wall, log it clearly
-    if "login" in current_url.lower() or "login" in title.lower():
-        log.warning("  %s: redirected to login — portal requires authentication", doc_code)
-        return []
+    for url in urls_to_try:
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+            await asyncio.sleep(1)
 
-    soup = BeautifulSoup(content, "lxml")
+            if "login" in page.url.lower():
+                log.warning("  %s: login redirect", doc_code)
+                break
 
-    # Parse any results table
-    for tbl in soup.find_all("table"):
-        rows = tbl.find_all("tr")
-        if len(rows) < 2: continue
-        hdrs = [th.get_text(strip=True).lower() for th in rows[0].find_all(["th","td"])]
-        if not any(h in " ".join(hdrs) for h in
-                   ["grantor","grantee","document","instrument","filed","recorded"]):
-            continue
-        for tr in rows[1:]:
-            cells = tr.find_all("td")
-            if not cells: continue
-            raw = {}
-            for i,cell in enumerate(cells):
-                k = hdrs[i] if i<len(hdrs) else f"c{i}"
-                raw[k] = cell.get_text(strip=True)
-                a = cell.find("a",href=True)
-                if a: raw[k+"_href"] = a["href"]
-            raw["_code"] = doc_code
-            rec = _make_record(raw)
-            if rec: results.append(rec)
+            content = await page.content()
+            soup = BeautifulSoup(content, "lxml")
+
+            # Log page structure for first doc type to debug
+            if doc_code == "LP":
+                title = await page.title()
+                log.info("  LP search page title: %s | url: %s", title, page.url)
+                tbls = soup.find_all("table")
+                log.info("  Tables found: %d", len(tbls))
+                for t in tbls[:3]:
+                    rows = t.find_all("tr")
+                    if rows:
+                        hdrs = [th.get_text(strip=True)[:30] for th in rows[0].find_all(["th","td"])]
+                        log.info("  Table headers: %s", hdrs)
+                # Also log any result count text
+                for el in soup.find_all(string=re.compile(r"result|record|found|total", re.I)):
+                    log.info("  Result text: %s", str(el)[:100])
+
+            # Parse tables
+            for tbl in soup.find_all("table"):
+                rows = tbl.find_all("tr")
+                if len(rows) < 2: continue
+                hdrs = [th.get_text(strip=True).lower()
+                        for th in rows[0].find_all(["th","td"])]
+                if not any(h in " ".join(hdrs)
+                           for h in ["grantor","grantee","document","instrument",
+                                     "filed","recorded","name","date"]):
+                    continue
+                found_data = False
+                for tr in rows[1:]:
+                    cells = tr.find_all("td")
+                    if not cells: continue
+                    raw = {}
+                    for i,cell in enumerate(cells):
+                        k = hdrs[i] if i<len(hdrs) else f"c{i}"
+                        raw[k] = cell.get_text(strip=True)
+                        a = cell.find("a",href=True)
+                        if a: raw[k+"_href"] = a["href"]
+                    raw["_code"] = doc_code
+                    rec = _make_record(raw)
+                    if rec:
+                        results.append(rec)
+                        found_data = True
+
+            if results:
+                break  # Found results with this URL format
+
+        except Exception as e:
+            log.warning("  URL format failed: %s", e)
 
     log.info("  %s -> %d", doc_code, len(results))
     return results
@@ -391,8 +402,8 @@ def _make_record(raw):
             return ""
         doc_num = g("instrument","doc #","docnum","number")
         filed   = g("filed","recorded","date")
-        grantor = g("grantor","owner","from")
-        grantee = g("grantee","to","buyer")
+        grantor = g("grantor","owner","from","name")
+        grantee = g("grantee","to","buyer","lender")
         legal   = g("legal","description")
         amount  = g("amount","consideration","debt")
         link    = gh("instrument","doc","view") or g("url","link")
@@ -403,7 +414,7 @@ def _make_record(raw):
         if link and not link.startswith("http"):
             link = CLERK_BASE+"/"+link.lstrip("/")
         if not link:
-            link = f"{CLERK_BASE}/recorder/web/docSearch.jsp?doc={doc_num}" if doc_num else CLERK_BASE
+            link = f"{CLERK_BASE}/recorder/web/docSearch.jsp"
         return {"doc_num":doc_num or "N/A","doc_type":code,"filed":fn,
                 "cat":cat,"cat_label":label,"owner":grantor.strip(),
                 "grantee":grantee.strip(),"amount":safe_float(amount),
@@ -420,12 +431,13 @@ def enrich(records, parcel):
     for rec in records:
         hit = parcel.lookup(rec.get("owner",""))
         if hit:
-            rec.update({"prop_address":hit["site_addr"],"prop_city":hit["site_city"] or "Fort Bend",
+            rec.update({"prop_address":hit["site_addr"],
+                        "prop_city":hit["site_city"] or "Fort Bend",
                         "prop_state":"TX","prop_zip":hit["site_zip"],
                         "mail_address":hit["mail_addr"],"mail_city":hit["mail_city"],
                         "mail_state":hit["mail_state"] or "TX","mail_zip":hit["mail_zip"]})
             enriched += 1
-    log.info("Enriched %d/%d records with addresses", enriched, len(records))
+    log.info("Enriched %d/%d records", enriched, len(records))
     return records
 
 def dedup(records):
@@ -448,8 +460,8 @@ def write_json(payload, *paths):
 def write_csv(records, out_dir):
     out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
     p = out_dir/f"ghl_export_{datetime.utcnow().strftime('%Y%m%d')}.csv"
-    cols=["First Name","Last Name","Mailing Address","Mailing City","Mailing State","Mailing Zip",
-          "Property Address","Property City","Property State","Property Zip",
+    cols=["First Name","Last Name","Mailing Address","Mailing City","Mailing State",
+          "Mailing Zip","Property Address","Property City","Property State","Property Zip",
           "Lead Type","Document Type","Date Filed","Document Number","Amount/Debt Owed",
           "Seller Score","Motivated Seller Flags","Source","Public Records URL"]
     with p.open("w",newline="",encoding="utf-8") as f:
@@ -495,12 +507,12 @@ async def main():
 
     iso_start = start_dt.strftime("%Y-%m-%d")
     iso_end   = end_dt.strftime("%Y-%m-%d")
-    payload   = {"fetched_at":datetime.utcnow().isoformat()+"Z",
-                 "source":"Fort Bend County Clerk + FBCAD",
-                 "date_range":{"start":iso_start,"end":iso_end},
-                 "total":len(records),
-                 "with_address":sum(1 for r in records if r.get("prop_address")),
-                 "records":records}
+    payload = {"fetched_at":datetime.utcnow().isoformat()+"Z",
+               "source":"Fort Bend County Clerk + FBCAD",
+               "date_range":{"start":iso_start,"end":iso_end},
+               "total":len(records),
+               "with_address":sum(1 for r in records if r.get("prop_address")),
+               "records":records}
 
     write_json(payload, DASHBOARD_DIR/"records.json", DATA_DIR/"records.json")
     write_csv(records, DATA_DIR)

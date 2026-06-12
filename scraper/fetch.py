@@ -171,18 +171,15 @@ class ParcelLookup:
                     reader = csv.DictReader(io.StringIO(raw_csv), delimiter=delim)
                     cols = reader.fieldnames or []
 log.info("Property file columns: %s", cols[:20])
-
-# Sample property type values to understand what's in the field
-type_samples: set[str] = set()
-all_rows = list(reader)
-for row in all_rows[:5000]:
-    pt = (row.get("PropertyTypeCode","") or row.get("PropType","") or "").strip()
-    if pt: type_samples.add(pt)
-log.info("PropertyTypeCode sample values: %s", sorted(type_samples)[:30])
-
-res_count = 0
-skip_count = 0
-for row in all_rows:
+                    res_count = 0
+                    skip_count = 0
+                    type_samples: set[str] = set()
+                    all_rows = list(reader)
+                    for row in all_rows:
+                        pt = (row.get("PropertyTypeCode","") or "").strip()
+                        if pt: type_samples.add(pt)
+                    log.info("PropertyTypeCode values found: %s", sorted(type_samples)[:40])
+                    for row in all_rows:
                         acct = row.get("PropertyQuickRefID","") or row.get("PropertyNumber","")
                         if not acct: continue
 
